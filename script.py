@@ -1,77 +1,135 @@
-import requests
 import os
-import csv
-from dotenv import load_dotenv
 import time
+from datetime import datetime
+
+import pandas as pd
+import requests
+import snowflake.connector
+from dotenv import load_dotenv
+from snowflake.connector.pandas_tools import write_pandas
 
 load_dotenv()
 
 MASSIVE_API_KEY = os.getenv('MASSIVE_API_KEY')
+MASSIVE_TICKERS_URL = 'https://api.massive.com/v3/reference/tickers'
 LIMIT = 1000
 # Massive API strictly limits to 5 requests per minute
 REQUEST_LIMIT = 5
 REQUEST_LIMIT_TIME = 60
 
-def run_stock_job():
-    URL = f'https://api.massive.com/v3/reference/tickers?market=stocks&active=true&order=asc&limit={LIMIT}&sort=ticker&apiKey={MASSIVE_API_KEY}'
+SNOWFLAKE_USER = os.getenv('SNOWFLAKE_USER')
+SNOWFLAKE_PASSWORD = os.getenv('SNOWFLAKE_PASSWORD')
+SNOWFLAKE_ACCOUNT = os.getenv('SNOWFLAKE_ACCOUNT')
+SNOWFLAKE_WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE', 'COMPUTE_WH')
+SNOWFLAKE_DATABASE = os.getenv('SNOWFLAKE_DATABASE', 'NBELL')
+SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'PUBLIC')
+SNOWFLAKE_TABLE = os.getenv('SNOWFLAKE_TABLE', 'STOCK_TICKERS')
 
-    example_ticker = {
-        'ticker': 'A',
-        'name': 'Agilent Technologies Inc.',
-        'market': 'stocks',
-        'locale': 'us',
-        'primary_exchange': 'XNYS',
-        'type': 'CS',
-        'active': True,
-        'currency_name': 'usd',
-        'cik': '0001090872',
-        'composite_figi': 'BBG000C2V3D6',
-        'share_class_figi': 'BBG001SCTQY4',
-        'last_updated_utc': '2026-08-10T06:08:34.415664315Z',
-    }
-    TICKER_SCHEMA_KEYS = list(example_ticker.keys())
-    OUTPUT_CSV = 'tickers.csv'
+TICKER_FIELDS = [
+    'ticker',
+    'name',
+    'market',
+    'locale',
+    'primary_exchange',
+    'type',
+    'active',
+    'currency_name',
+    'cik',
+    'composite_figi',
+    'share_class_figi',
+    'last_updated_utc',
+    'ds',
+]
 
 
-    def normalize_ticker(ticker):
-        return {key: ticker.get(key) for key in TICKER_SCHEMA_KEYS}
+def normalize_ticker(ticker, ds):
+    row = {field: ticker.get(field) for field in TICKER_FIELDS}
+    row['ds'] = ds
+    return row
 
 
-    response = requests.get(URL)
+def with_api_key(url):
+    separator = '&' if '?' in url else '?'
+    return f'{url}{separator}apiKey={MASSIVE_API_KEY}'
+
+
+def fetch_tickers_page(url):
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+
+def throttle_if_needed(request_count):
+    """Stay under the Massive API request limit; reset the counter after waiting."""
+    if request_count <= REQUEST_LIMIT:
+        return request_count
+
+    print('Request limit reached, waiting 1 minute...')
+    time.sleep(REQUEST_LIMIT_TIME)
+    return 1
+
+
+def fetch_all_tickers():
+    ds = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    url = with_api_key(
+        f'{MASSIVE_TICKERS_URL}'
+        f'?market=stocks&active=true&order=asc&limit={LIMIT}&sort=ticker'
+    )
     tickers = []
     request_count = 0
 
-    data = response.json()
-    print(data.keys())
-    print(data['next_url'])
+    while url:
+        request_count = throttle_if_needed(request_count + 1)
+        print(f'Request {request_count}: fetching page...')
 
-    for ticker in data['results']:
-        tickers.append(normalize_ticker(ticker))
-    request_count += 1
+        data = fetch_tickers_page(url)
+        page = [normalize_ticker(ticker, ds) for ticker in data.get('results', [])]
+        tickers.extend(page)
+        print(f'Fetched {len(tickers)} tickers so far')
 
-    while 'next_url' in data:
-        request_count += 1
-        if request_count > REQUEST_LIMIT:
-            print('Request limit reached, waiting 1 minute...')
-            time.sleep(REQUEST_LIMIT_TIME)
-            request_count = 1
-        print('Request count:', request_count)
-        print('Fetching next page...', data['next_url'])
-        response = requests.get(data['next_url'] + f'&apiKey={MASSIVE_API_KEY}')
-        data = response.json()
-        for ticker in data['results']:
-            tickers.append(normalize_ticker(ticker))
-        print('Fetched', len(tickers), 'tickers')
+        next_url = data.get('next_url')
+        url = with_api_key(next_url) if next_url else None
 
-    print(len(tickers))
+    return tickers
 
-    # write to csv
-    with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=TICKER_SCHEMA_KEYS)
-        writer.writeheader()
-        writer.writerows(tickers)
 
-    print(f'Wrote {len(tickers)} tickers to {OUTPUT_CSV}')
+def load_tickers_to_snowflake(tickers):
+    df = pd.DataFrame(tickers)
+    df.columns = [column.upper() for column in df.columns]
+
+    conn = snowflake.connector.connect(
+        user=SNOWFLAKE_USER,
+        password=SNOWFLAKE_PASSWORD,
+        account=SNOWFLAKE_ACCOUNT,
+        warehouse=SNOWFLAKE_WAREHOUSE,
+        database=SNOWFLAKE_DATABASE,
+        schema=SNOWFLAKE_SCHEMA,
+    )
+    try:
+        success, nchunks, nrows, _ = write_pandas(
+            conn,
+            df,
+            table_name=SNOWFLAKE_TABLE,
+            auto_create_table=True,
+            overwrite=True,
+            quote_identifiers=False,
+        )
+        if not success:
+            raise RuntimeError('Failed to load tickers into Snowflake')
+        print(
+            f'Wrote {nrows} tickers to '
+            f'{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE} '
+            f'({nchunks} chunk(s))'
+        )
+    finally:
+        conn.close()
+
+
+def run_stock_job():
+    tickers = fetch_all_tickers()
+    print(f'Total tickers: {len(tickers)}')
+    load_tickers_to_snowflake(tickers)
+
 
 if __name__ == '__main__':
     run_stock_job()

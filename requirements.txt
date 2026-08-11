@@ -2,3 +2,5 @@ requests
 openai
 dotenv
 schedule
+pandas
+snowflake-connector-python[pandas]
