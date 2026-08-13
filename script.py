@@ -101,7 +101,7 @@ def throttle_if_needed(request_count):
 
 
 def fetch_all_tickers():
-    ds = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ds = datetime.now().replace(minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
     url = with_api_key(
         f'{MASSIVE_TICKERS_URL}'
         f'?market=stocks&active=true&order=asc&limit={LIMIT}&sort=ticker'
