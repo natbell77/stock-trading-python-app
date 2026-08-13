@@ -55,6 +55,8 @@ SNOWFLAKE_WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE', 'COMPUTE_WH')
 SNOWFLAKE_DATABASE = os.getenv('SNOWFLAKE_DATABASE', 'NBELL')
 SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'PUBLIC')
 SNOWFLAKE_TABLE = os.getenv('SNOWFLAKE_TABLE', 'STOCK_TICKERS')
+SNOWFLAKE_PRIMARY_KEY = os.getenv('SNOWFLAKE_PRIMARY_KEY', 'TICKER,DS')
+STAGING_TABLE_SUFFIX = '_STAGING'
 
 TICKER_FIELDS = [
     'ticker',
@@ -124,9 +126,59 @@ def fetch_all_tickers():
     return tickers
 
 
+def parse_primary_key_columns():
+    columns = [
+        column.strip().upper()
+        for column in SNOWFLAKE_PRIMARY_KEY.split(',')
+        if column.strip()
+    ]
+    if not columns:
+        raise ValueError('SNOWFLAKE_PRIMARY_KEY must include at least one column')
+    return columns
+
+
+def qualified_table(table_name):
+    return f'{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{table_name}'
+
+
+def build_merge_sql(target_table, staging_table, columns, primary_key_columns):
+    on_clause = ' AND '.join(
+        f'target.{column} = staging.{column}' for column in primary_key_columns
+    )
+    update_columns = [column for column in columns if column not in primary_key_columns]
+    when_matched = ''
+    if update_columns:
+        update_clause = ', '.join(
+            f'target.{column} = staging.{column}' for column in update_columns
+        )
+        when_matched = f'WHEN MATCHED THEN UPDATE SET {update_clause}'
+
+    insert_columns = ', '.join(columns)
+    insert_values = ', '.join(f'staging.{column}' for column in columns)
+
+    return f"""
+        MERGE INTO {target_table} AS target
+        USING {staging_table} AS staging
+        ON {on_clause}
+        {when_matched}
+        WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})
+    """
+
+
 def load_tickers_to_snowflake(tickers):
     df = pd.DataFrame(tickers)
     df.columns = [column.upper() for column in df.columns]
+    primary_key_columns = parse_primary_key_columns()
+
+    missing_primary_key_columns = set(primary_key_columns) - set(df.columns)
+    if missing_primary_key_columns:
+        raise ValueError(
+            'Primary key columns missing from ticker data: '
+            f'{", ".join(sorted(missing_primary_key_columns))}'
+        )
+
+    target_table = qualified_table(SNOWFLAKE_TABLE)
+    staging_table = qualified_table(f'{SNOWFLAKE_TABLE}{STAGING_TABLE_SUFFIX}')
 
     conn = snowflake.connector.connect(
         user=SNOWFLAKE_USER,
@@ -137,23 +189,42 @@ def load_tickers_to_snowflake(tickers):
         schema=SNOWFLAKE_SCHEMA,
     )
     try:
-        success, nchunks, nrows, _ = write_pandas(
+        cursor = conn.cursor()
+
+        success, _, nrows, _ = write_pandas(
             conn,
             df,
-            table_name=SNOWFLAKE_TABLE,
+            table_name=f'{SNOWFLAKE_TABLE}{STAGING_TABLE_SUFFIX}',
             auto_create_table=True,
             overwrite=True,
             quote_identifiers=False,
         )
         if not success:
-            raise RuntimeError('Failed to load tickers into Snowflake')
+            raise RuntimeError('Failed to load tickers into Snowflake staging table')
+
+        cursor.execute(
+            f'CREATE TABLE IF NOT EXISTS {target_table} AS '
+            f'SELECT * FROM {staging_table} WHERE 1 = 0'
+        )
+
+        merge_sql = build_merge_sql(
+            target_table,
+            staging_table,
+            list(df.columns),
+            primary_key_columns,
+        )
+        logger.info('Executing Snowflake merge query:\n%s', merge_sql.strip())
+        cursor.execute(merge_sql)
+        cursor.execute('SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))')
+        merge_stats = cursor.fetchone()
+
         logger.info(
-            'Wrote %s tickers to %s.%s.%s (%s chunk(s))',
+            'Upserted %s tickers into %s using primary key (%s); '
+            'merge stats: %s',
             nrows,
-            SNOWFLAKE_DATABASE,
-            SNOWFLAKE_SCHEMA,
-            SNOWFLAKE_TABLE,
-            nchunks,
+            target_table,
+            ', '.join(primary_key_columns),
+            merge_stats,
         )
     finally:
         conn.close()
