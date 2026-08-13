@@ -1,6 +1,8 @@
+import logging
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -9,6 +11,35 @@ from dotenv import load_dotenv
 from snowflake.connector.pandas_tools import write_pandas
 
 load_dotenv()
+
+LOG_DIR = Path(__file__).parent / 'logs'
+LOG_FILE = Path(os.getenv('LOG_FILE', LOG_DIR / 'stock_job.log'))
+
+logger = logging.getLogger(__name__)
+
+
+def configure_logging():
+    root = logging.getLogger()
+    if root.handlers:
+        return
+
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    root.setLevel(logging.INFO)
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+
 
 MASSIVE_API_KEY = os.getenv('MASSIVE_API_KEY')
 MASSIVE_TICKERS_URL = 'https://api.massive.com/v3/reference/tickers'
@@ -64,7 +95,7 @@ def throttle_if_needed(request_count):
     if request_count <= REQUEST_LIMIT:
         return request_count
 
-    print('Request limit reached, waiting 1 minute...')
+    logger.info('Request limit reached, waiting 1 minute...')
     time.sleep(REQUEST_LIMIT_TIME)
     return 1
 
@@ -80,12 +111,12 @@ def fetch_all_tickers():
 
     while url:
         request_count = throttle_if_needed(request_count + 1)
-        print(f'Request {request_count}: fetching page...')
+        logger.info('Request %s: fetching page...', request_count)
 
         data = fetch_tickers_page(url)
         page = [normalize_ticker(ticker, ds) for ticker in data.get('results', [])]
         tickers.extend(page)
-        print(f'Fetched {len(tickers)} tickers so far')
+        logger.info('Fetched %s tickers so far', len(tickers))
 
         next_url = data.get('next_url')
         url = with_api_key(next_url) if next_url else None
@@ -116,19 +147,25 @@ def load_tickers_to_snowflake(tickers):
         )
         if not success:
             raise RuntimeError('Failed to load tickers into Snowflake')
-        print(
-            f'Wrote {nrows} tickers to '
-            f'{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE} '
-            f'({nchunks} chunk(s))'
+        logger.info(
+            'Wrote %s tickers to %s.%s.%s (%s chunk(s))',
+            nrows,
+            SNOWFLAKE_DATABASE,
+            SNOWFLAKE_SCHEMA,
+            SNOWFLAKE_TABLE,
+            nchunks,
         )
     finally:
         conn.close()
 
 
 def run_stock_job():
+    configure_logging()
+    logger.info('Starting stock job')
     tickers = fetch_all_tickers()
-    print(f'Total tickers: {len(tickers)}')
+    logger.info('Total tickers: %s', len(tickers))
     load_tickers_to_snowflake(tickers)
+    logger.info('Stock job completed')
 
 
 if __name__ == '__main__':
