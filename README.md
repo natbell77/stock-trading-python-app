@@ -59,7 +59,7 @@ tail -f logs/stock_job.log
 
 - Paginates through all active stock tickers from Massive
 - Respects the API rate limit (5 requests/minute)
-- Stamps each row with a `ds` run timestamp (`YYYY-MM-DD HH:MM:SS`)
+- Stamps each row with a `ds` run timestamp truncated to the hour (`YYYY-MM-DD HH:00:00`)
 - Creates or overwrites the Snowflake table on each successful run
 - Logs progress to `logs/stock_job.log` (and the console) with timestamps
 
