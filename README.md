@@ -29,9 +29,10 @@ SNOWFLAKE_WAREHOUSE=COMPUTE_WH
 SNOWFLAKE_DATABASE=NBELL
 SNOWFLAKE_SCHEMA=PUBLIC
 SNOWFLAKE_TABLE=STOCK_TICKERS
+SNOWFLAKE_PRIMARY_KEY=TICKER,DS
 ```
 
-`SNOWFLAKE_WAREHOUSE`, `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, and `SNOWFLAKE_TABLE` are optional and fall back to the defaults above.
+`SNOWFLAKE_WAREHOUSE`, `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_TABLE`, and `SNOWFLAKE_PRIMARY_KEY` are optional and fall back to the defaults above.
 
 `LOG_FILE` is also optional and defaults to `logs/stock_job.log`.
 
@@ -60,7 +61,7 @@ tail -f logs/stock_job.log
 - Paginates through all active stock tickers from Massive
 - Respects the API rate limit (5 requests/minute)
 - Stamps each row with a `ds` run timestamp truncated to the hour (`YYYY-MM-DD HH:00:00`)
-- Creates or overwrites the Snowflake table on each successful run
+- Upserts rows into Snowflake on each successful run using `MERGE` and the configured primary key (default: `TICKER`, `DS`)
 - Logs progress to `logs/stock_job.log` (and the console) with timestamps
 
 ## Logging
@@ -77,6 +78,6 @@ Override the log file path with `LOG_FILE` in `.env`.
 
 ## Snowflake Output
 
-Rows are written to `{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}` (default: `NBELL.PUBLIC.STOCK_TICKERS`) with these columns:
+Rows are upserted into `{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE}` (default: `NBELL.PUBLIC.STOCK_TICKERS`) using the primary key from `SNOWFLAKE_PRIMARY_KEY` (default: `TICKER`, `DS`). Existing rows with the same key are updated; new keys are inserted.
 
 `TICKER`, `NAME`, `MARKET`, `LOCALE`, `PRIMARY_EXCHANGE`, `TYPE`, `ACTIVE`, `CURRENCY_NAME`, `CIK`, `COMPOSITE_FIGI`, `SHARE_CLASS_FIGI`, `LAST_UPDATED_UTC`, `DS`
